@@ -34,6 +34,7 @@ seaborn>=0.13.0
 
 # RAG / agentic layer
 anthropic>=0.26.0
+fastmcp>=2.0.0
 faiss-cpu>=1.8.0
 sentence-transformers>=3.0.0
 

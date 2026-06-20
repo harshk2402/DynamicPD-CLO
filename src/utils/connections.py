@@ -6,7 +6,14 @@ load_dotenv()
 
 def get_wrds_connection():
     import wrds
-    return wrds.Connection(wrds_username=os.environ["WRDS_USERNAME"])
+    connect_args = {
+        "sslmode": "require",
+        "passfile": os.path.expanduser("~/.pgpass"),
+    }
+    return wrds.Connection(
+        wrds_username=os.environ["WRDS_USERNAME"],
+        wrds_connect_args=connect_args,
+    )
 
 
 def get_fred_client():

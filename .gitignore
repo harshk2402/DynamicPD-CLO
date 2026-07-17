@@ -222,3 +222,6 @@ __marimo__/
 # Claude
 .claude/
 CLAUDE.md
+
+# Downloaded Data
+data/

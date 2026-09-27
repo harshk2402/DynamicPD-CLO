@@ -10,17 +10,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RATINGS_PATH = PROJECT_ROOT / "data/raw/wrds/fisd_extra/fisd_ratings.parquet"
 ISSUE_MASTER_PATH = PROJECT_ROOT / "data/raw/wrds/fisd_rated_issue_master.parquet"
 ISSUE_DEFAULT_PATH = PROJECT_ROOT / "data/raw/wrds/fisd_extra/fisd_issue_default.parquet"
+ENHANCEMENT_PATH = PROJECT_ROOT / "data/raw/wrds/fisd_extra/fisd_issue_enhancement.parquet"
 BONDCRSP_LINK_PATH = PROJECT_ROOT / "data/raw/wrds/bondcrsp_link.parquet"
 CCM_LINKS_PATH = PROJECT_ROOT / "data/raw/merton/ccm_links.parquet"
 COMPUSTAT_ANNUAL_DIR = PROJECT_ROOT / "data/raw/wrds/compustat_annual"
 OUTPUT_DIR = PROJECT_ROOT / "data/processed/downgrades"
 EVENTS_PATH = OUTPUT_DIR / "downgrade_events.parquet"
 AGENCY_PANEL_PATH = OUTPUT_DIR / "issuer_quarter_ratings_by_agency.parquet"
+EPISODES_PATH = OUTPUT_DIR / "default_episodes.parquet"
 MANIFEST_PATH = OUTPUT_DIR / "downgrade_events_manifest.json"
 
 START_QUARTER = "2000Q1"
 END_QUARTER = "2024Q4"
 AGENCIES = ("SPR", "MR", "FR")
+AGENCY_NAMES = {"SPR": "sp", "MR": "moodys", "FR": "fitch"}
+HORIZONS = (1, 4, 8)
 
 # S&P and Fitch share notation; Moody's does not. Mapping per agency rather than through one
 # merged dictionary removes any chance of a notation collision.
@@ -49,7 +53,18 @@ EXCLUDED_BOND_TYPES = {
     "ADEB", "AMTN", "ARNT",      # agency paper: 87.4%, 91.8% and 98.0% AAA respectively
     "USNT",                      # treasury: 99.0% AAA
 }
-SENIOR_UNSECURED = "SEN"
+# Third-party insurance and letters of credit: the rating reflects the backer, not the issuer.
+EXTERNAL_BACKING_TYPES = {"INS", "LOC"}
+# Ratings are used unconverted and labelled by the kind of bond they came from; the model learns what a
+# subordinated or secured rating means. Unclassified issues (NON) are never used: against S&P company
+# ratings they sit a median 3 notches better, consistent with insured or structured paper.
+SOURCE_OF_LEVEL = {
+    "SEN": "senior_unsecured",
+    "SS": "secured",
+    "SENS": "subordinated", "SUB": "subordinated", "JUNS": "subordinated", "JUN": "subordinated",
+}
+TIER_RANK = {"senior_unsecured": 0, "secured": 1, "subordinated": 2}
+LEVEL_RANK = {"SEN": 0, "SS": 0, "SENS": 0, "SUB": 1, "JUNS": 2, "JUN": 3}
 CCM_COLUMNS = ("gvkey", "lpermno", "linkdt", "linkenddt", "linktype", "linkprim")
 OPEN_END = pd.Timestamp("2099-12-31")
 
@@ -93,15 +108,19 @@ def load_issue_master() -> pd.DataFrame:
     m["cusip6"] = m["issuer_cusip"].astype("string").str.upper().str.strip().str[:6]
     before = len(m)
     m = m[~m["bond_type"].astype("string").isin(EXCLUDED_BOND_TYPES)]
-    log(f"issue master: {before:,} issues, {len(m):,} after bond-type exclusion")
+    enh = pd.read_parquet(ENHANCEMENT_PATH, columns=["issue_id", "enh_type"])
+    backed = pd.to_numeric(enh.loc[enh["enh_type"].isin(EXTERNAL_BACKING_TYPES), "issue_id"], errors="coerce")
+    m = m[~m["issue_id"].isin(set(backed.dropna().astype("int64")))]
+    log(f"issue master: {before:,} issues, {len(m):,} after bond-type and third-party-backing exclusion")
     return m.dropna(subset=["offering_date"])
 
 
-def load_issue_defaults() -> pd.DataFrame:
-    d = pd.read_parquet(ISSUE_DEFAULT_PATH, columns=["issue_id", "default_date"])
+def load_default_records() -> pd.DataFrame:
+    d = pd.read_parquet(ISSUE_DEFAULT_PATH, columns=["issue_id", "default_date", "reinstated_date"])
     d["issue_id"] = pd.to_numeric(d["issue_id"], errors="coerce").astype("int64")
     d["default_date"] = pd.to_datetime(d["default_date"], errors="coerce")
-    return d.dropna(subset=["default_date"]).groupby("issue_id", as_index=False)["default_date"].min()
+    d["reinstated_date"] = pd.to_datetime(d["reinstated_date"], errors="coerce")
+    return d.dropna(subset=["default_date"])
 
 
 def load_ccm_links() -> pd.DataFrame:
@@ -235,125 +254,263 @@ def issue_quarter_ratings(ratings: pd.DataFrame, master: pd.DataFrame, defaults:
     return frame[["issue_id", "quarter_end", "ord"]]
 
 
-def issuer_quarter_ratings(iq: pd.DataFrame, master: pd.DataFrame, links: pd.DataFrame,
-                           agency: str) -> pd.DataFrame:
-    """Collapse issue-quarters to issuer-quarters under both the pre-specified primary hierarchy
-    and the worst-active robustness rule."""
-    d = iq.merge(master[["issue_id", "security_level", "offering_amt"]], on="issue_id", how="left")
-    d = d.merge(links[["issue_id", "gvkey"]], on="issue_id", how="inner")
-    d["is_senior_unsecured"] = d["security_level"].astype("string").eq(SENIOR_UNSECURED)
+def quarter_index(values: pd.Series) -> pd.Series:
+    """Consecutive integer per calendar quarter, so quarter gaps and horizons are plain arithmetic."""
+    return values.dt.year * 4 + (values.dt.month - 1) // 3
 
-    # Primary: representative senior unsecured issue by largest original offering amount;
-    # fall back to the largest active issue when the firm has no senior unsecured bond.
-    d = d.sort_values(["gvkey", "quarter_end", "is_senior_unsecured", "offering_amt"],
-                      ascending=[True, True, False, False])
-    primary = d.drop_duplicates(["gvkey", "quarter_end"], keep="first")
-    primary = primary.rename(columns={"ord": "rating_primary"})
-    primary["used_senior_unsecured"] = primary["is_senior_unsecured"]
 
-    worst = d.groupby(["gvkey", "quarter_end"])["ord"].max().rename("rating_worst").reset_index()
-    n_issues = d.groupby(["gvkey", "quarter_end"])["issue_id"].size().rename("n_active_issues").reset_index()
+def enrich_issue_quarters(iq: pd.DataFrame, master: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
+    """Attach issuer, seniority and the issue's own rating in the previous quarter. prev_ord is set only
+    when the same agency rated the same issue at t-1, so a new, maturing or re-rated issue can never
+    look like a cut."""
+    d = iq.merge(master[["issue_id", "security_level", "offering_amt"]], on="issue_id")
+    d = d.merge(links[["issue_id", "gvkey"]], on="issue_id")
+    d["security_level"] = d["security_level"].astype("string")
+    d = d[d["security_level"].isin(SOURCE_OF_LEVEL)].copy()
+    d["rating_source"] = d["security_level"].map(SOURCE_OF_LEVEL)
+    d["q"] = quarter_index(d["quarter_end"])
+    d = d.sort_values(["issue_id", "q"])
+    g = d.groupby("issue_id")
+    d["prev_ord"] = g["ord"].shift().where(g["q"].shift() == d["q"] - 1)
+    return d.reset_index(drop=True)
 
-    out = (primary[["gvkey", "quarter_end", "rating_primary", "used_senior_unsecured"]]
-           .merge(worst, on=["gvkey", "quarter_end"], how="left")
-           .merge(n_issues, on=["gvkey", "quarter_end"], how="left"))
-    out["agency"] = agency
+
+def reference_ratings(d: pd.DataFrame) -> pd.DataFrame:
+    """One rating per issuer-quarter for one agency: the representative senior unsecured issue, else the
+    most senior other issue. The rating is used unconverted and labelled with its source."""
+    d = d.assign(tier=d["rating_source"].map(TIER_RANK), level_rank=d["security_level"].map(LEVEL_RANK))
+    ref = d.sort_values(["gvkey", "quarter_end", "tier", "level_rank", "offering_amt", "issue_id"],
+                        ascending=[True, True, True, True, False, True])
+    ref = ref.drop_duplicates(["gvkey", "quarter_end"])
+    ref = ref.rename(columns={"ord": "rating_ord", "issue_id": "ref_issue_id"})
+    g = d.groupby(["gvkey", "quarter_end"])
+    extra = pd.DataFrame({"rating_worst": g["ord"].max(), "n_active_issues": g["issue_id"].size()}).reset_index()
+    return ref[["gvkey", "quarter_end", "q", "rating_ord", "rating_source", "ref_issue_id"]].merge(
+        extra, on=["gvkey", "quarter_end"], how="left")
+
+
+def bond_cut_events(d: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFrame:
+    """Issuer-quarters in which the agency cut at least one issue it also rated in the previous quarter.
+    Primary: a cut on an issue of the issuer's source tier at t-1 (senior unsecured when it had one).
+    Strict: a cut on the t-1 reference issue, or on a majority of that tier's issues.
+    Any bond: a cut on any issue of any seniority."""
+    prev_ref = ref[["gvkey", "q", "rating_source", "ref_issue_id"]].rename(
+        columns={"rating_source": "prev_source", "ref_issue_id": "prev_ref_issue"})
+    prev_ref = prev_ref.assign(q=prev_ref["q"] + 1)
+    b = d[d["prev_ord"].notna()].merge(prev_ref, on=["gvkey", "q"], how="inner")
+    b["cut"] = b["ord"] > b["prev_ord"]
+    b["eligible"] = b["rating_source"] == b["prev_source"]
+    b["eligible_cut"] = b["cut"] & b["eligible"]
+    b["ref_cut"] = b["cut"] & (b["issue_id"] == b["prev_ref_issue"])
+    g = b.groupby(["gvkey", "quarter_end", "q"])
+    out = g.agg(n_eligible=("eligible", "sum"), n_eligible_cut=("eligible_cut", "sum"),
+                ref_cut=("ref_cut", "any"), any_cut=("cut", "any")).reset_index()
+    out["cut_primary"] = out["n_eligible_cut"] > 0
+    out["cut_strict"] = out["ref_cut"] | (out["n_eligible_cut"] * 2 > out["n_eligible"])
+    out["cut_anybond"] = out["any_cut"]
+    return out[["gvkey", "quarter_end", "q", "cut_primary", "cut_strict", "cut_anybond"]]
+
+
+def default_episodes(records: pd.DataFrame, links: pd.DataFrame, master: pd.DataFrame,
+                     ratings: pd.DataFrame) -> pd.DataFrame:
+    """One row per issuer default episode: the quarter of the first default and the quarter the issuer
+    re-emerged, taken as the earlier of a FISD reinstatement or the first rating on debt issued after the
+    default. Defaults inside an episode belong to it; the next episode starts after re-emergence."""
+    rec = records.merge(links[["issue_id", "gvkey"]], on="issue_id")
+    first_rating = (ratings[ratings["ord"].notna()].groupby("issue_id")["rating_date"].min()
+                    .rename("first_rating").reset_index())
+    new_debt = (master[["issue_id", "offering_date"]].merge(first_rating, on="issue_id")
+                .merge(links[["issue_id", "gvkey"]], on="issue_id"))
+    new_debt = new_debt[new_debt["gvkey"].isin(set(rec["gvkey"]))]
+
+    rows = []
+    for gvkey, r in rec.groupby("gvkey"):
+        dates = np.sort(r["default_date"].unique())
+        debt = new_debt[new_debt["gvkey"] == gvkey]
+        i = 0
+        while i < len(dates):
+            start = pd.Timestamp(dates[i])
+            reinstated = r.loc[(r["default_date"] >= start) & (r["reinstated_date"] > start), "reinstated_date"]
+            fresh = debt.loc[(debt["offering_date"] > start) & (debt["first_rating"] > start), "first_rating"]
+            candidates = [x for x in (reinstated.min(), fresh.min()) if pd.notna(x)]
+            emerge = min(candidates) if candidates else pd.NaT
+            rows.append((gvkey, start, emerge))
+            if pd.isna(emerge):
+                break
+            later = np.nonzero(dates > np.datetime64(emerge))[0]
+            if len(later) == 0:
+                break
+            i = int(later[0])
+
+    ep = pd.DataFrame(rows, columns=["gvkey", "default_date", "emerge_date"])
+    ep["default_q"] = quarter_index(pd.to_datetime(ep["default_date"]))
+    ep["emerge_q"] = quarter_index(pd.to_datetime(ep["emerge_date"]))
+    return ep
+
+
+def post_default_mask(frame: pd.DataFrame, episodes: pd.DataFrame) -> np.ndarray:
+    """True for issuer-quarters strictly after a default quarter and before re-emergence. A defaulted
+    issuer cannot be downgraded further, so these quarters carry no early-warning content."""
+    if episodes.empty or frame.empty:
+        return np.zeros(len(frame), dtype=bool)
+    m = frame[["gvkey", "q"]].reset_index().merge(episodes[["gvkey", "default_q", "emerge_q"]], on="gvkey")
+    end = m["emerge_q"].fillna(np.inf)
+    hit = m.loc[(m["q"] > m["default_q"]) & (m["q"] < end), "index"]
+    return frame.index.isin(hit)
+
+
+def combine_agencies(refs: pd.DataFrame) -> pd.DataFrame:
+    """Issuer-quarter rating across agencies: the most senior source tier any agency has, then the middle
+    of three / lower of two / single rating among the agencies at that tier."""
+    refs = refs.assign(tier=refs["rating_source"].map(TIER_RANK))
+    best = refs.groupby(["gvkey", "quarter_end"])["tier"].transform("min")
+    at_best = refs[refs["tier"] == best].sort_values(["gvkey", "quarter_end", "rating_ord"])
+    g = at_best.groupby(["gvkey", "quarter_end"])
+    pick = g.cumcount() == g["rating_ord"].transform("size") // 2
+    out = at_best.loc[pick, ["gvkey", "quarter_end", "q", "rating_ord", "rating_source"]].copy()
+    spread = g["rating_ord"].agg(lambda s: s.max() - s.min()).rename("rating_dispersion")
+
+    rg = refs.groupby(["gvkey", "quarter_end"])
+    extra = pd.DataFrame({
+        "rating_worst": rg["rating_worst"].max(),
+        "n_active_issues": rg["n_active_issues"].max(),
+        "n_agencies": rg["agency"].nunique(),
+    })
+    presence = pd.crosstab([refs["gvkey"], refs["quarter_end"]], refs["agency"]).gt(0)
+    for agency, name in AGENCY_NAMES.items():
+        extra[f"has_{name}"] = presence[agency] if agency in presence.columns else False
+    out = out.merge(spread.reset_index(), on=["gvkey", "quarter_end"]).merge(
+        extra.reset_index(), on=["gvkey", "quarter_end"])
+    out["senior_unsecured_source"] = out["rating_source"] == "senior_unsecured"
+    return out.reset_index(drop=True)
+
+
+def make_labels(rows: pd.DataFrame, events: pd.DataFrame, observable: pd.Series, name: str,
+                with_countdown: bool = False) -> pd.DataFrame:
+    """Contemporaneous flag and forward labels from a set of event quarters. The flag at t is NaN when the
+    issuer was not observed at t-1 and no default occurred, since no cut could have been seen. Horizons that
+    run past the sample end are NaN, never a silent zero. Labels are calendar-based, so a gap in an issuer's
+    rows cannot stretch a 4-quarter window."""
+    ev = events[["gvkey", "q"]].astype({"gvkey": "string", "q": "int64"}).drop_duplicates()
+    key = pd.MultiIndex.from_frame(rows[["gvkey", "q"]].astype({"gvkey": "string", "q": "int64"}))
+    is_event = key.isin(pd.MultiIndex.from_frame(ev))
+    out = pd.DataFrame(index=rows.index)
+    out[name] = np.where(is_event, 1.0, np.where(observable.to_numpy(), 0.0, np.nan))
+
+    left = rows[["gvkey", "q"]].astype({"gvkey": "string", "q": "int64"}).reset_index().sort_values("q")
+    right = ev.rename(columns={"q": "next_q"}).sort_values("next_q")
+    nxt = pd.merge_asof(left, right, left_on="q", right_on="next_q", by="gvkey",
+                        direction="forward", allow_exact_matches=False).set_index("index")
+    gap = (nxt["next_q"] - nxt["q"]).reindex(rows.index)
+
+    last_q = quarter_index(pd.Series([quarter_ends()[-1]])).iloc[0]
+    for h in HORIZONS:
+        val = (gap <= h).astype(float)
+        val[rows["q"] + h > last_q] = np.nan
+        out[f"{name}_{h}q"] = val
+    if with_countdown:
+        out[f"quarters_to_next_{name}"] = gap
     return out
 
 
-def add_downgrade_labels(panel: pd.DataFrame, rating_col: str, prefix: str) -> pd.DataFrame:
-    """Downgrade when the issuer-quarter rating worsens against the previous quarter, plus the
-    forward-looking horizons. Horizons that run past the sample end are NaN, never a silent zero."""
-    panel = panel.sort_values(["gvkey", "quarter_end"]).copy()
-    prev = panel.groupby("gvkey")[rating_col].shift()
-    panel[f"{prefix}_downgrade"] = ((panel[rating_col] > prev) & prev.notna()).astype("float")
-    panel.loc[prev.isna(), f"{prefix}_downgrade"] = np.nan
+def observed_last_quarter(rows: pd.DataFrame) -> pd.Series:
+    key = pd.MultiIndex.from_frame(rows[["gvkey", "q"]])
+    prev = pd.MultiIndex.from_arrays([rows["gvkey"], rows["q"] - 1])
+    return pd.Series(prev.isin(key), index=rows.index)
 
-    last_q = panel["quarter_end"].max()
-    g = panel.groupby("gvkey")[f"{prefix}_downgrade"]
-    for h in (1, 4, 8):
-        fwd = g.transform(lambda s: s[::-1].rolling(h, min_periods=1).max()[::-1].shift(-1))
-        horizon_end = panel["quarter_end"] + pd.offsets.QuarterEnd(h)
-        panel[f"{prefix}_downgrade_{h}q"] = np.where(horizon_end > last_q, np.nan, fwd)
 
-    def quarters_to_next(s: pd.Series) -> pd.Series:
-        arr = s.to_numpy()
-        out = np.full(len(arr), np.nan)
-        nxt = np.nan
-        for i in range(len(arr) - 1, -1, -1):
-            out[i] = nxt
-            if arr[i] == 1:
-                nxt = 1
-            elif not np.isnan(nxt):
-                nxt = nxt + 1
-        return pd.Series(out, index=s.index)
-
-    panel[f"{prefix}_quarters_to_next_downgrade"] = (
-        panel.groupby("gvkey")[f"{prefix}_downgrade"].transform(quarters_to_next))
-    return panel
+def label_panel(rows: pd.DataFrame, event_sets: dict, episodes: pd.DataFrame) -> pd.DataFrame:
+    """event_sets: {column name: events frame (gvkey, q)}. Events inside a post-default window are ignored,
+    then post-default rows are dropped."""
+    observable = observed_last_quarter(rows)
+    parts = [rows]
+    for name, ev in event_sets.items():
+        ev = ev.reset_index(drop=True)
+        ev = ev[~post_default_mask(ev, episodes)]
+        parts.append(make_labels(rows, ev, observable, name, with_countdown=(name == "downgrade")))
+    out = pd.concat(parts, axis=1)
+    return out[~post_default_mask(out, episodes)].reset_index(drop=True)
 
 
 def build() -> tuple:
     master = load_issue_master()
-    defaults = load_issue_defaults()
+    records = load_default_records()
     links = link_issues_to_gvkey(master)
     master = master[master["issue_id"].isin(set(links["issue_id"]))]
     log(f"issues carrying a gvkey: {len(master):,} across {links['gvkey'].nunique():,} firms")
 
     ratings = load_and_clean_ratings(set(master["issue_id"]))
+    records = records[records["issue_id"].isin(set(master["issue_id"]))]
+    window_defaults = records.groupby("issue_id", as_index=False)["default_date"].min()
+    episodes = default_episodes(records, links, master, ratings)
+    default_events = episodes[["gvkey", "default_q"]].rename(columns={"default_q": "q"})
+    log(f"default episodes: {len(episodes):,} across {episodes['gvkey'].nunique():,} issuers")
 
-    per_agency = []
+    refs, cuts = [], []
     for agency in AGENCIES:
-        iq = issue_quarter_ratings(ratings, master, defaults, agency)
+        iq = issue_quarter_ratings(ratings, master, window_defaults, agency)
         if iq.empty:
             continue
-        ia = issuer_quarter_ratings(iq, master, links, agency)
-        log(f"  {agency}: {len(iq):,} issue-quarters -> {len(ia):,} issuer-quarters, {ia['gvkey'].nunique():,} firms")
-        per_agency.append(ia)
-    agency_panel = pd.concat(per_agency, ignore_index=True)
+        d = enrich_issue_quarters(iq, master, links)
+        ref = reference_ratings(d)
+        cut = bond_cut_events(d, ref)
+        refs.append(ref.assign(agency=agency))
+        cuts.append(cut.assign(agency=agency))
+        log(f"  {agency}: {len(ref):,} issuer-quarters, {int(cut['cut_primary'].sum()):,} primary cuts")
+    refs = pd.concat(refs, ignore_index=True)
+    cuts = pd.concat(cuts, ignore_index=True)
 
-    # Cross-agency: worst rating across agencies present, plus dispersion and coverage.
-    combined = agency_panel.groupby(["gvkey", "quarter_end"]).agg(
-        rating_primary=("rating_primary", "max"),
-        rating_primary_best=("rating_primary", "min"),
-        rating_worst=("rating_worst", "max"),
-        n_agencies=("agency", "nunique"),
-        n_active_issues=("n_active_issues", "max"),
-        used_senior_unsecured=("used_senior_unsecured", "max"),
-    ).reset_index()
-    combined["rating_dispersion"] = combined["rating_primary"] - combined["rating_primary_best"]
+    def events(flag: str, agency: str | None = None) -> pd.DataFrame:
+        c = cuts if agency is None else cuts[cuts["agency"] == agency]
+        return pd.concat([c.loc[c[flag], ["gvkey", "q"]], default_events], ignore_index=True)
 
-    combined = add_downgrade_labels(combined, "rating_primary", "primary")
-    combined = add_downgrade_labels(combined, "rating_worst", "worst")
-    agency_panel = pd.concat(
-        [add_downgrade_labels(d, "rating_primary", "primary") for _, d in agency_panel.groupby("agency")],
-        ignore_index=True)
-    return combined, agency_panel
+    combined = combine_agencies(refs)
+    event_sets = {"downgrade": events("cut_primary"),
+                  "downgrade_strict": events("cut_strict"),
+                  "downgrade_anybond": events("cut_anybond")}
+    for agency, name in AGENCY_NAMES.items():
+        event_sets[f"downgrade_{name}"] = events("cut_primary", agency)
+    combined = label_panel(combined, event_sets, episodes)
+    # Per-agency labels describe the rows that agency actually rates.
+    for agency, name in AGENCY_NAMES.items():
+        cols = [c for c in combined.columns if c.startswith(f"downgrade_{name}")]
+        combined.loc[~combined[f"has_{name}"], cols] = np.nan
+    combined["default_event"] = pd.MultiIndex.from_frame(combined[["gvkey", "q"]]).isin(
+        pd.MultiIndex.from_frame(default_events)).astype(int)
+
+    agency_panel = []
+    for agency, name in AGENCY_NAMES.items():
+        rows = refs[refs["agency"] == agency].reset_index(drop=True)
+        agency_panel.append(label_panel(rows, {"downgrade": events("cut_primary", agency)}, episodes))
+    agency_panel = pd.concat(agency_panel, ignore_index=True)
+    return combined, agency_panel, episodes
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build FISD issuer-quarter ratings and downgrade labels.")
     parser.parse_args()
 
-    combined, agency_panel = build()
+    combined, agency_panel, episodes = build()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(EVENTS_PATH, index=False)
     agency_panel.to_parquet(AGENCY_PANEL_PATH, index=False)
+    episodes.to_parquet(EPISODES_PATH, index=False)
 
     stats = {
         "issuer_quarters": int(len(combined)),
         "firms": int(combined["gvkey"].nunique()),
         "quarter_range": [str(combined["quarter_end"].min().date()), str(combined["quarter_end"].max().date())],
-        "senior_unsecured_share": float(combined["used_senior_unsecured"].mean()),
-        "primary_downgrade_rate": float(combined["primary_downgrade"].mean()),
-        "worst_downgrade_rate": float(combined["worst_downgrade"].mean()),
-        "primary_vs_worst_disagreement": float((combined["rating_primary"] != combined["rating_worst"]).mean()),
+        "rating_source_shares": combined["rating_source"].value_counts(normalize=True).round(4).to_dict(),
+        "default_episodes": int(len(episodes)),
         "mean_n_agencies": float(combined["n_agencies"].mean()),
     }
-    for h in (1, 4, 8):
-        stats[f"primary_downgrade_{h}q_rate"] = float(combined[f"primary_downgrade_{h}q"].mean())
+    for name in ["downgrade", "downgrade_strict", "downgrade_anybond",
+                 *[f"downgrade_{n}" for n in AGENCY_NAMES.values()]]:
+        stats[f"{name}_rate"] = float(combined[name].mean())
+        for h in HORIZONS:
+            stats[f"{name}_{h}q_rate"] = float(combined[f"{name}_{h}q"].mean())
     write_json_atomic(MANIFEST_PATH, {"created_at_utc": utc_now(), **stats})
-    log(f"saved {EVENTS_PATH} and {AGENCY_PANEL_PATH}")
+    log(f"saved {EVENTS_PATH}, {AGENCY_PANEL_PATH} and {EPISODES_PATH}")
     log(json.dumps(stats, indent=2))
 
 

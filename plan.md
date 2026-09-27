@@ -166,9 +166,9 @@ magnitudes, not final sample counts.
    - Do not use `amount_outstanding` for historical weighting because the available field is a sparse/current snapshot rather than a validated historical series
 4. Reconstruct issuer-quarter ratings from active rated issues using a pre-specified hierarchy:
    - Primary methodology, representative senior unsecured issue: at each quarter-end, identify all active rated issues; if one or more senior unsecured issues exist, select the senior unsecured issue with the largest original `offering_amt`; this becomes the issuer rating for that quarter
-   - Fallback methodology, estimated senior rating: if no senior unsecured issue exists, take the most senior remaining active rated issue and shift its rating by the cross-sectional notching offset for its security level. Superseded the original largest-offering fallback on 2026-09-26; see "Fallback rating decision" below for the method and validation
+   - Fallback methodology: if no senior unsecured issue exists, take the most senior other issue and use its rating unconverted, recording the kind of bond it came from in `rating_source` (`senior_unsecured`, `secured`, `subordinated`). No notching offset is applied and no issuer-quarter is dropped. Superseded the original largest-offering fallback; see "Rating level decision" below for the method and the evidence
    - Robustness methodology, worst active issue rating: separately reconstruct issuer-quarter ratings using the worst rating among all active rated issues
-   - Ratings are reconstructed per agency. The combined issuer rating level is the middle of three agency ratings, or the lower of two, or the single rating present
+   - Ratings are reconstructed per agency. The combined issuer rating takes the most senior source tier any agency has, then the middle of three / lower of two / single agency rating at that tier
 5. Construct downgrade events from actual rating cuts on bonds, never from changes in a reconstructed rating level (revised 2026-09-27; see "Label construction decisions" below):
    - Per agency: a downgrade in quarter t when the agency lowered its rating on at least one of the issuer's active senior unsecured issues that it also rated in quarter t-1; issuers with no senior unsecured issue use the fallback reference issue
    - A default recorded in `fisd_issue_default` on any of the issuer's issues is a downgrade event in the quarter of the earliest default date, for every agency, whatever the ratings did
@@ -182,12 +182,12 @@ magnitudes, not final sample counts.
 8. Document coverage rate (% of final matched issuer-quarters with at least one active rating) and recompute downgrade-event frequencies after final FISD → Bond-CRSP → CCM → Compustat linkage and DealScan restriction.
 9. Report issuer-rating construction diagnostics:
    - Percentage of issuer-quarters using the representative senior unsecured rule
-   - Percentage of issuer-quarters using the estimated-senior-rating fallback
+   - Percentage of issuer-quarters by `rating_source`
    - Disagreement rate between the primary construction and the worst-rating construction
    - Downgrade counts under each methodology and each robustness label
    - Defaults: count, share with a rating cut vs a withdrawal in the default quarter, share with a prior cut, and a completeness cross-check against CRSP bankruptcy delisting codes
    - Agreement of the rebuilt S&P rating and events with `comp.adsprate` over 2000-2016
-10. Save to `data/raw/downgrades/downgrade_events.parquet`
+10. Save to `data/processed/downgrades/`: `downgrade_events.parquet` (issuer-quarter panel with labels), `issuer_quarter_ratings_by_agency.parquet` and `default_episodes.parquet`; diagnostics report to `data/output/tables/downgrade_diagnostics.md`
 
 **Phase 0 field verification (2026-09-18) - read before implementing:**
 
@@ -320,117 +320,131 @@ flags (`has_sp`, `has_moodys`, `has_fitch`) alongside `n_agencies`.
 - Strict bond-cut rule: the cut must hit the representative issue at t-1 or a majority of the issuer's active
   senior unsecured issues, to test whether single-issue actions drive results
 - Events from cuts on any active issue, not senior unsecured only
-- Senior-unsecured-only sample (see the fallback decision below)
+- Senior-unsecured-only sample (see the rating level decision below)
 - Worst-active-issue rating level, as originally pre-specified
 
 These decisions were made from agreement with an external rating and from the mechanics of the data, before
 any model was fit.
 
-**Fallback rating decision (2026-09-26):**
+**Rating level decision: no conversion, rating source as a feature (2026-09-27):**
 
-*Problem.* Agencies rate bonds, not companies: each bond's rating is the company rating shifted up or down
-for its place in the repayment order (secured above, subordinated below). Senior unsecured bonds carry the
-company rating almost exactly, so they are the primary representative. About 17% of issuer-quarters (19% of
-train, 9% of test) have no active rated senior unsecured bond, and the original fallback - largest remaining
-bond, rating used as-is - inherits that bond's notching. Fallback firms are disproportionately high yield
-(70% of fallback issuer-quarters vs 43% of senior unsecured ones), so the error concentrates in the
-leveraged-borrower population the project targets.
+*Problem.* Agencies rate bonds, not companies: each bond's rating is the company rating shifted for its place
+in the repayment order (secured above, subordinated below). Senior unsecured bonds carry the company rating
+almost exactly. About 17% of issuer-quarters have no active rated senior unsecured issue, so their only
+ratings are notched away from the company rating.
 
-*Method: cross-sectional notching offset, measured against senior unsecured bonds.*
-1. Reference issue: the most senior active rated issue, in the order senior secured (`SS`), senior
-   subordinated (`SENS`), subordinated (`SUB`), junior subordinated (`JUNS`), junior (`JUN`); largest
-   original `offering_amt` breaks ties. Unclassified issues (`NON`) are never used as a reference: against
-   S&P company ratings they sit a median 3 notches better (mean 4), consistent with insured or structured
-   paper.
-2. Offsets: across every issuer-quarter where a firm has both an active senior unsecured issue and an active
-   issue of level L, record `rating(L) - rating(SEN)` on the same firm, same quarter and same agency. The
-   offset for (agency, L, IG/HY) is the median of these gaps across all firms. Measuring each gap inside one
-   firm and quarter isolates the effect of the security level from differences between firms.
-3. Estimated senior rating = reference issue rating - offset, clipped to the ordinal scale.
-4. Offsets are estimated on 2000-2018 only and applied unchanged to 2019-2024, per the train/test wall, and
-   estimated separately for S&P, Moody's and Fitch, so no agency borrows another's notching practice.
-5. Carry a `rating_estimated` flag on every issuer-quarter whose level comes from this fallback.
+*Decision.* Ratings are used as the agency issued them, labelled with the kind of bond they came from. No
+notching offset is estimated or applied, and no issuer-quarter is dropped for lack of a senior unsecured issue.
+1. Reference issue per agency: the representative senior unsecured issue (largest original `offering_amt`);
+   otherwise the most senior other issue, in the order senior secured (`SS`), senior subordinated (`SENS`),
+   subordinated (`SUB`), junior subordinated (`JUNS`), junior (`JUN`), largest `offering_amt` breaking ties.
+   Never used: unclassified issues (`NON`; against S&P company ratings they sit a median 3 notches better,
+   consistent with insured or structured paper) and issues backed by a third party
+   (`fisd_issue_enhancement.enh_type` `INS` or `LOC`).
+2. Rating source: `senior_unsecured`, `secured` (`SS`) or `subordinated` (`SENS`, `SUB`, `JUNS`, `JUN`).
+   Shares of issuer-quarters: 83.3%, 5.3% and 11.4%.
+3. Combined across agencies: take the most senior source tier any agency has, then the middle of three / lower
+   of two / single rating among the agencies at that tier. That tier is the issuer-quarter's `rating_source`.
+4. Model features: `rating_ord` (1 = AAA ... 22 = D, unconverted) and `rating_source` (categorical; for the
+   tree models native categorical or two indicators with senior unsecured as baseline), plus `n_agencies`,
+   agency presence flags and `rating_dispersion`. The logistic benchmark gets the source indicators and their
+   interactions with `rating_ord` explicitly, since it cannot find them itself.
+5. Static benchmark: historical 4-quarter downgrade rate per (rating bucket, source), computed on 2000-2018.
+   Senior unsecured uses notch-level buckets; subordinated and secured use letter-grade buckets (BB, B, CCC and
+   below, etc.) so the cells are not thin; sparse cells pool upward to the letter grade.
 
-*Scope.* The fallback sets only the rating level (rating feature, static benchmark buckets). Downgrade
-events do not depend on it.
+*Scope.* This sets only the rating level. Downgrade events come from bond cuts and defaults and do not depend
+on it.
 
-*Relation to the literature.* This is a simplified form of Moody's Senior Ratings Algorithm (SRA), which
-Moody's uses to give every entity a senior unsecured rating for its default and transition studies. The
-original SRA (Hamilton 2005; Gupta, Parwani & Emery 2009) notched non-senior ratings by fixed rules. The
-redesigned SRA (Kanthan, Ou, Agarwal & Irfan, "Moody's Revised Senior Ratings Algorithm", Special Comment,
-Sept 2017; in use since Oct 2015) replaced these with rules inferred from data - the same core step adopted
-here. The redesigned SRA's steps are: (1) drop ineligible credits, including externally backed ones;
-(2) group each entity's debt by class, seniority, backing and currency, taking the median-worst rating within
-a group; (3) set each group's notching rule to the modal gap to the senior unsecured rating among entities
-holding both, conditioned on time, the group's rating level, region and sector, and formed only if at least
-50% of entities and at least 10 entities share the mode; (4) take as reference the group whose rule is most
-consistent, with more targeted rules winning ties; (5) smooth artificial rating changes caused by
-switching reference group or rule; (6) drop periods with no rated debt. The adopted method keeps the core of
-step 3 but estimates one median offset per (agency, seniority, IG/HY) pooled over the training period, and
-uses a fixed seniority order in step 4. Why the coarser rules were chosen is set out in the comparison
-below. The redesigned SRA contains no step that reuses a firm's own historical gap; that idea was tested
-separately and rejected (below).
+*Why not convert.* Every conversion tested was usually one notch off, and the error moved with the years it
+was learned on, because agencies' notching varies across firms and drifted over the sample. Scored against
+S&P's company rating (`comp.adsprate.splticrm`, which ends Feb 2017 and so can validate but not replace the
+construction), on fallback issuer-quarters, learning on one period and testing on another:
 
-*Validation.* Estimated S&P ratings were compared with S&P's own company rating (`comp.adsprate.splticrm`,
-quarter-end months). That table ends in Feb 2017, which is why it can validate the construction but cannot
-replace it as the label source. Offsets were estimated on 2000-2010 and scored on the 2,877 fallback
-issuer-quarters of 2011-2016:
+| Conversion tested | Exact | Off 2+ notches | Mean error |
+| --- | --- | --- | --- |
+| None (bond rating as-is) | 14-34% | 36-67% | -0.30 to +1.13 |
+| Offset vs same firm's senior unsecured bond, all levels | 17-28% | 16-36% | +0.02 to +0.70 |
+| Offset vs S&P company rating, all levels | 15-43% | 16-23% | -0.59 to +0.78 |
+| Same-firm offset, subordinated only (secured-only dropped) | 16-34% | 5-10% | +0.11 to +0.69 |
+| Rolling 5-year same-firm offsets | 24% | 37% | +0.43 |
+| Firm's own past gap first | 27% | 20% | +0.13 |
+| *Yardstick: senior unsecured issue as-is* | *72%* | *12%* | *+0.20* |
 
-| Method | Exact | Off by 1 notch | Off by 2+ | Mean error |
-| --- | --- | --- | --- | --- |
-| No shift (original fallback) | 34% | 30% | 36% | -0.30 |
-| Cross-sectional offset, measured against S&P company ratings | 43% | 35% | 22% | -0.55 |
-| **Cross-sectional offset, measured against senior unsecured bonds (adopted)** | 27% | 56% | **17%** | **+0.06** |
-| Firm's own past gap first, then adopted offset | 27% | 53% | 20% | +0.13 |
-| *Yardstick: senior unsecured issue as-is, 2000-2016* | *72%* | *16%* | *12%* | *+0.20* |
+Ranges span the two time splits (learn 2000-08/test 2009-16 and the reverse) and, for the same-firm offset,
+the 2000-2018 learning window. Specific findings:
+- Offsets measured on firms holding both senior unsecured and another class transfer to subordinated debt but
+  not to secured debt: with both present, unsecured bonds sit below the company rating because secured lenders
+  rank first, so the secured-unsecured gap is wide; with secured debt alone it sits at or near the company
+  rating. The high-yield secured offset was -1 learned on 2000-2010 and -2 on 2000-2018, and two-notch misses
+  moved from 17% to 36% on that change alone.
+- Notching drifted: the high-yield senior subordinated gap fell from about 2 notches in the early 2000s to 1 by
+  the 2010s and 0 by 2020. Fixed offsets are off by a notch in some periods; rolling offsets were worse (the
+  recent windows are noisiest, which is the test period, where no company rating exists to check).
+- Offsets measured against S&P's company rating were most often exact but leaned about half a notch optimistic
+  out of sample, which would put risky firms in safer benchmark buckets and flatter the ML model, and exist for
+  S&P only.
+- Moody's redesigned Senior Ratings Algorithm (Kanthan, Ou, Agarwal & Irfan, Special Comment, Sept 2017; in
+  use since Oct 2015; successor to the fixed-rule SRA of Hamilton 2005 and Gupta, Parwani & Emery 2009) infers
+  modal notching gaps per (debt group, rating level, region, sector, time), formed only when at least 50% and
+  at least 10 entities agree, and picks the most consistent group as reference. Implemented exactly on this
+  data, rules formed for only 45 of 7,358 S&P, 186 of 7,640 Moody's and 421 of 5,878 Fitch cases when
+  estimating a hidden senior unsecured rating (2011-2018), and 15 of 2,900 real S&P fallback cases: Moody's
+  runs it on its full global universe including loans and entity-level ratings, which a US bond-only sample
+  cannot match. Where rules formed they were somewhat more accurate, but on data-rich, regular cases. A
+  relaxed version (pooled 2000-2010, coarser cells) formed rules for 26-40% and 7-10% of the same cases and
+  improved overall accuracy by about one point.
 
-Mean error is estimate minus S&P ordinal; positive means the estimate is worse than the true rating. The
-adopted method has the fewest misses of two notches or more and essentially no bias. The S&P-measured
-offset hits exactly more often but leans half a notch optimistic, which would put risky firms in safer
-static-benchmark buckets, weaken the benchmark and flatter the ML model; a pessimistic lean would err in the
-conservative direction. Reusing a firm's own past gap applied to only 13% of fallback issuer-quarters
-without look-ahead (31% if future history is allowed, which a point-in-time feature cannot use), and where it
-applied it scored 59% within one notch against 84% for the cross-sectional offset. The likely reason:
-notching reflects the debt ranked ahead of an issue, so once the senior unsecured bond is gone the firm's old
-gap is stale.
+Letting the model learn what a subordinated or secured rating means, per rating level and from the training
+data, removes this whole class of error instead of managing it, keeps every issuer, and treats all three
+agencies alike. The trade-offs are thinner static-benchmark cells for non-senior sources (handled by
+letter-grade buckets), explicit interactions in the logistic benchmark, and rating levels that are not
+directly comparable across sources in descriptive reporting.
 
-*Comparison with Moody's redesigned SRA (2026-09-26).* Two tests. Test 1 (all agencies, the SRA paper's own
-accuracy measure): for issuer-quarters that do have a senior unsecured rating, hide it, estimate it from the
-firm's other debt, and compare, 2011-2018. Test 2 (S&P only): the real fallback issuer-quarters against S&P's
-company rating, 2011-2016. Rules were learned on data before the evaluation window only.
+This choice was made from agreement with an external rating and the mechanics of the data, before any model
+was fit, not on model performance, so it respects the pre-specification rule.
 
-- *Exact SRA* (steps 1-4 as specified; sector = SIC division from CRSP; trailing 20-quarter window; step 5
-  omitted because it changes levels over time rather than per-quarter accuracy and is not fully specified).
-  Rules almost never form at this sample size: estimates exist for 45 of 7,358 S&P, 186 of 7,640 Moody's and
-  421 of 5,878 Fitch Test 1 cases, and 15 of 2,900 Test 2 cases. Where they form they are somewhat more
-  accurate (e.g. Moody's ratings: 51% exact and 5% off 2+ against 44% and 18% for the adopted method on the
-  same 186 cases), but they are the data-rich, regular cases. Moody's applies the SRA to its full global rated
-  universe including loans and entity-level ratings; a US bond-only sample cannot populate its cells.
-- *Relaxed SRA* (modal gap with the 50%/10-entity consensus, rules pooled over 2000-2010, at three
-  granularities: IG/HY, letter grade, letter grade x sector; adopted method where no rule forms). Rules form
-  for 26-40% of Test 1 cases but only 7-10% of Test 2 cases, because real fallback firms have unusual capital
-  structures. Where rules form they are 1-6 points more often exact. Over all cases the gain is about one
-  point: best Test 2 variant 28% exact / 16% off 2+ / +0.02 against 27% / 17% / +0.05 for the adopted method;
-  Test 1 gains are 0-2 points exact. Granularity makes no material difference.
+*Robustness.* Senior-unsecured-only sample: keeps 147,239 of 177,446 issuer-quarters (83%; 2,854 of 3,490
+firms; 986 of 1,091 test-period downgrades) but removes about 26% of high-yield DealScan-borrower
+issuer-quarters (subordinated-source issuers are 81% high yield), so it is a check, not the primary sample.
 
-Decision: keep the adopted method. The exact SRA cannot produce estimates at this sample size, and the relaxed
-SRA's one-point gain does not justify a two-stage rule-formation step. Test 1 also shows the method is less
-precise for firms holding both senior unsecured and other debt (25-36% off 2+) than for the real fallback
-population (17%); this does not affect its use but is a stated caveat on precision.
+**Issuer linkage: FISD parent route tested and rejected (2026-09-27).** FISD's issuer table
+(`fisd.fisd_mergedissuer`) carries `parent_id`, which refers to the parent's `agent_id`, so a third linkage
+route could attach bonds issued by subsidiaries and financing vehicles to the listed parent. Tested two ways:
+- *Parent as recorded.* Rejected. `parent_id` is a present-day snapshot, not point-in-time, so historical bonds
+  attach to later acquirers (Hertz Corp to Ford, Rohm & Haas to DuPont, Alleghany to Berkshire Hathaway, US
+  Airways to American Airlines), and some parent CUSIP lookups hit unrelated firms. Where the current routes
+  also link an issue, the parent route agrees on the gvkey only 73.7% of the time.
+- *Parent accepted only when the subsidiary and the Compustat company share a name root.* Plausible on a spot
+  check and 89.1% agreement with the current routes, but small gains on non-financial, non-utility issuers:
+  issuer-quarters 129,417 to 131,591 (+1.7%), firms +11, downgrade events 9,053 to 9,341 (+3.2%), test-period
+  events 1,357 to 1,431 (+5.5%), 2019-2024 default episodes 65 to 68. 60% of the newly linked issues belong to
+  financials or utilities, which are excluded later.
+The case for the route rested on apparently missing defaults (Hertz, Frontier, Weatherford, Valaris,
+Mallinckrodt, EP Energy). Those were missing only at issue level: at issuer level all six defaults are already
+captured through other linked bonds, since one linked bond per issuer suffices. A 2-5% gain does not justify a
+name-matching heuristic over a non-point-in-time field. Known side effect of the current routes: a subsidiary
+with its own Compustat record is its own issuer (e.g. Mallinckrodt Inc and Mallinckrodt plc); this is rare and
+does not affect labels.
 
-This choice was made on agreement with an external rating before any model was fit, not on model
-performance, so it respects the pre-specification rule.
+**Verified build (2026-09-27), from `data/output/tables/downgrade_diagnostics.md`:**
+- 175,371 issuer-quarters, 3,479 firms, 2000-2024. Rating source: 83.4% senior unsecured, 11.0% subordinated,
+  5.6% secured.
+- Primary label: 7.0% within 1 quarter, 19.6% within 4, 30.3% within 8 (12,155 events). Strict: 6.1 / 17.5 /
+  27.6%. Any bond: 7.3 / 20.3 / 31.1%. Single agency: S&P 4.5 / 14.5 / 23.9%, Moody's 3.9 / 12.7 / 21.0%, Fitch
+  3.5 / 11.2 / 18.8%.
+- Cyclical: 13-14% per quarter in 2001-02, 12.7% in 2009, 9.5% in 2020; 3-5% in the other test years.
+- Against S&P company ratings (2000-2016): 87.2% of S&P downgrades caught in the same quarter (90.1% within
+  one); 78.5% of our S&P events match an S&P downgrade in the same quarter (82.8% within one). Senior unsecured
+  rating level exact 71.9%.
+- Defaults: 558 episodes (2000-2024) across 524 issuers; 15.9% had every rating withdrawn by the default
+  quarter, so only the default rule catches them; 79.2% had a downgrade event in the prior four quarters. Of 143
+  CRSP bankruptcy delistings (code 574) among panel firms, 77.6% have a FISD default within four quarters.
+- Few test-period defaults after 2020: 16 (2019), 40 (2020), then 5, 6, 6, 2 (2021-2024).
+- 784 of our S&P events have no S&P company downgrade within a quarter; a sample of 40 is in
+  `data/output/tables/downgrade_unmatched_sp_sample.csv` for spot checks.
 
-*Robustness.* Re-run on the senior-unsecured-only sample. Dropping fallback quarters keeps 147,239 of
-177,446 issuer-quarters (83%; 2,854 of 3,490 firms; 986 of 1,091 test-period downgrades), but removes about
-26% of high-yield DealScan-borrower issuer-quarters, so it tilts the sample toward investment grade and is a
-robustness check rather than the primary sample.
-
-*Limitations.* The fallback remains less precise than the primary rule (83% within one notch vs 88%). The
-external validation covers S&P only; Moody's and Fitch offsets are estimated the same way but cannot be
-checked against a company-level rating.
-
-**Files created:** `src/preprocessing/downgrades.py`, `data/raw/downgrades/downgrade_events.parquet`
+**Files created:** `src/preprocessing/downgrades.py`, `src/preprocessing/downgrade_diagnostics.py`, `src/data/sp_ratings.py` (raw extract of `comp.adsprate` to `data/raw/wrds/sp_issuer_ratings.parquet`, used only for validation), `data/processed/downgrades/downgrade_events.parquet`, `data/processed/downgrades/issuer_quarter_ratings_by_agency.parquet`, `data/processed/downgrades/default_episodes.parquet`, `data/output/tables/downgrade_diagnostics.md`
 
 ---
 
@@ -648,6 +662,7 @@ active at 2019-Q1, of which 600 carry a gvkey and 140 also have a rated bond out
 3. For each horizon (1q, 4q, 8q) × each model (XGBoost, LightGBM, LogisticRegression):
    - Target: `downgrade_{horizon}` binary flag from Chunk 5
    - Tune hyperparameters via CV (learning rate, max depth, n_estimators for GBM; C for logistic)
+   - `rating_source` enters the tree models as a categorical feature; the logistic model gets source indicators and their interactions with `rating_ord` explicitly
    - Initial feature set: all candidate columns in train excluding target columns and identifiers
    - No feature selection step may use 2019–2024 test data
 4. Benchmark specification:
@@ -738,7 +753,7 @@ re-check this count before assuming 100 names are available.
 1. Create `src/clo/portfolio_quality.py`
 2. For each quarter-end in test period (2019-Q1 through 2024-Q4):
    - Pull 4q-ahead downgrade probability for each of the 100 firms from ML model
-   - Static rating proxy: map the current primary reconstructed issuer rating to the historical 4-quarter downgrade frequency for that rating bucket, computed exclusively from 2000–2018 training observations.
+   - Static rating proxy: map the current primary reconstructed issuer rating and its `rating_source` to the historical 4-quarter downgrade frequency for that (rating bucket, source) cell, computed exclusively from 2000–2018 training observations (Chunk 5, "Rating level decision").
    - Pool downgrade signal = equal-weighted average predicted downgrade probability across portfolio
 3. Repeat the portfolio evaluation using the worst-rating construction as a robustness check and report it separately from the primary static benchmark
 4. Track concentration: count of firms above 75th percentile threshold (`n_elevated`) per quarter
@@ -894,9 +909,9 @@ DM lead time analysis removed. TRACE DM data is no longer the primary evaluation
 
 ## Key Constraints (Enforce Throughout)
 
-- **Train/test wall**: winsorization bounds, z-score normalization, downgrade probability threshold for lead time, static rating bucket rates — all computed on 2000–2018 only, applied to 2019–2024
+- **Train/test wall**: winsorization bounds, z-score normalization, downgrade probability threshold for lead time, static (rating bucket, source) rates — all computed on 2000–2018 only, applied to 2019–2024
 - **Walk-forward CV only** — no random splits at any stage
-- **Issuer-level rating aggregation is pre-specified**: The primary hierarchy is: 1. representative senior unsecured issue; 2. estimated senior rating from the most senior remaining issue, shifted by the cross-sectional notching offset (Chunk 5, "Fallback rating decision"). The worst active issue construction is robustness only. Never choose the aggregation rule based on model performance or test-set results. Never use current `amount_outstanding` as a historical aggregation weight.
+- **Issuer-level rating aggregation is pre-specified**: The primary hierarchy is: 1. representative senior unsecured issue; 2. otherwise the most senior other issue, rating unconverted and labelled by `rating_source`; no notching offsets are estimated (Chunk 5, "Rating level decision"). The worst active issue construction is robustness only. Never choose the aggregation rule based on model performance or test-set results. Never use current `amount_outstanding` as a historical aggregation weight.
 - **Point-in-time data timing**: Compustat features use `rdq`; IBES consensus features use `statpers`; CCM and Bond-CRSP links must respect valid link dates; ratings use known rating dates; CRSP uses data through quarter-end only; macro observations must be available by quarter-end.
 - **IBES linkage and missingness**: Exact normalized CUSIP8 is the confirmed primary IBES linkage. Unmatched IBES firms remain in the sample with missing analyst variables and missingness indicators.
 - **Macro/credit scope**: HY OAS and other truncated ICE OAS histories are excluded from the 2000–2024 primary model because accessible histories do not cover the full primary sample.

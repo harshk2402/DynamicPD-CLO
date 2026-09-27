@@ -73,6 +73,29 @@ REQUIRED_COLUMNS = (
     "cheq",
 )
 
+# Point-in-time alignment takes the latest filing with rdq <= quarter_end. Without an age limit, a
+# firm that stops filing (delisted, acquired, taken private) keeps its last fundamentals forever.
+# Live filers (CRSP price present) have accounting_age_days p99 = 146 and p99.5 = 203, so 270 days
+# tolerates one missed filing but not two. Beyond the cap the row is kept - labels and market data
+# may still be live, e.g. an LBO'd firm with public bonds - but the accounting values are nulled.
+DEFAULT_STALENESS_CAP_DAYS = 270
+
+# Values that describe the firm's financial state and must not be carried past the cap. Filing
+# identifiers (datadate, rdq, fyearq, ...) are kept so the staleness stays traceable.
+STALE_NULLED_COLUMNS = (
+    "atq",
+    "ltq",
+    "total_debt",
+    "dlttq",
+    "dlcq",
+    "xintq",
+    "oibdpq",
+    "niq",
+    "actq",
+    "lctq",
+    "cheq",
+)
+
 FEATURE_COLUMNS = (
     "leverage",
     "coverage",
@@ -103,6 +126,7 @@ OUTPUT_COLUMNS = (
     "lctq",
     "cheq",
     "accounting_age_days",
+    "accounting_stale",
     "rdq_missing",
     "debt_component_missing",
     "coverage_missing",
@@ -183,7 +207,9 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         "cheq",
     ):
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Plain float64: the raw files can restore as nullable Float64, whose comparisons
+            # return pd.NA and break np.where below. Values are unchanged (NA -> NaN).
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
     debt_parts = df[["dlttq", "dlcq"]]
     df["debt_component_missing"] = debt_parts.isna().any(axis=1)
@@ -313,7 +339,11 @@ def quarter_ends(start_year: int, end_year: int) -> list[pd.Timestamp]:
     return [p.to_timestamp(freq="D", how="end").normalize() for p in periods]
 
 
-def aligned_quarter(observations: pd.DataFrame, quarter_end: pd.Timestamp) -> pd.DataFrame:
+def aligned_quarter(
+    observations: pd.DataFrame,
+    quarter_end: pd.Timestamp,
+    staleness_cap_days: int = DEFAULT_STALENESS_CAP_DAYS,
+) -> pd.DataFrame:
     eligible = observations[
         (observations["rdq"] <= quarter_end)
         & (observations["datadate"] <= quarter_end)
@@ -326,6 +356,10 @@ def aligned_quarter(observations: pd.DataFrame, quarter_end: pd.Timestamp) -> pd
     aligned["accounting_age_days"] = (
         aligned["quarter_end"] - aligned["rdq"]
     ).dt.days
+    aligned["accounting_stale"] = aligned["accounting_age_days"] > staleness_cap_days
+    null_cols = [c for c in (*STALE_NULLED_COLUMNS, *FEATURE_COLUMNS) if c in aligned.columns]
+    aligned[null_cols] = aligned[null_cols].astype("float64")
+    aligned.loc[aligned["accounting_stale"], null_cols] = np.nan
     return aligned[[col for col in OUTPUT_COLUMNS if col in aligned.columns]]
 
 
@@ -334,6 +368,7 @@ def write_aligned_panel(
     start_year: int,
     end_year: int,
     output_path: Path,
+    staleness_cap_days: int = DEFAULT_STALENESS_CAP_DAYS,
 ) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_name(f".{output_path.name}.tmp")
@@ -343,10 +378,11 @@ def write_aligned_panel(
     writer: pq.ParquetWriter | None = None
     rows_by_year: dict[str, int] = {}
     total_rows = 0
+    stale_rows = 0
 
     try:
         for quarter_end in quarter_ends(start_year, end_year):
-            aligned = aligned_quarter(observations, quarter_end)
+            aligned = aligned_quarter(observations, quarter_end, staleness_cap_days)
             if aligned.empty:
                 rows_by_year.setdefault(str(quarter_end.year), 0)
                 continue
@@ -357,6 +393,7 @@ def write_aligned_panel(
                 table = table.cast(writer.schema)
             writer.write_table(table)
             row_count = len(aligned)
+            stale_rows += int(aligned["accounting_stale"].sum())
             rows_by_year[str(quarter_end.year)] = rows_by_year.get(str(quarter_end.year), 0) + row_count
             total_rows += row_count
             log(f"Aligned Compustat features for {quarter_end.date()}: {row_count:,} rows")
@@ -368,7 +405,13 @@ def write_aligned_panel(
         raise RuntimeError("No aligned Compustat rows were written")
 
     os.replace(tmp_path, output_path)
-    return {"row_count": total_rows, "rows_by_year": rows_by_year}
+    return {
+        "row_count": total_rows,
+        "rows_by_year": rows_by_year,
+        "staleness_cap_days": staleness_cap_days,
+        "stale_rows": stale_rows,
+        "stale_share": float(stale_rows / total_rows) if total_rows else 0.0,
+    }
 
 
 def validate_output(path: Path, start_year: int, end_year: int) -> dict:
@@ -416,6 +459,7 @@ def process_compustat(
     start_year: int = DEFAULT_START_YEAR,
     end_year: int = DEFAULT_END_YEAR,
     force: bool = False,
+    staleness_cap_days: int = DEFAULT_STALENESS_CAP_DAYS,
 ) -> dict:
     if start_year < 2000:
         raise ValueError("start_year must be 2000 or later for the modeling panel")
@@ -440,6 +484,7 @@ def process_compustat(
         start_year,
         end_year,
         OUTPUT_PATH,
+        staleness_cap_days,
     )
     validation = validate_output(OUTPUT_PATH, start_year, end_year)
 
@@ -458,6 +503,7 @@ def process_compustat(
         "end_year": end_year,
         "standard_filters": STANDARD_FILTERS,
         "point_in_time_policy": "Rows with missing rdq are excluded. rdq is never imputed; accounting observations are eligible only when rdq <= quarter_end.",
+        "staleness_policy": "Rows whose latest eligible filing is older than staleness_cap_days are kept, flagged accounting_stale, and have accounting values and features set to NaN.",
         "winsorization_note": "No winsorization is performed during preprocessing. Any clipping/scaling must be estimated within each training fold during model training.",
         "missing_rdq_rows": int(missing_rdq_rows),
         "missing_rdq_percent": missing_rdq_percent,
@@ -489,6 +535,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Rebuild output even if a valid file already exists.")
     parser.add_argument("--start-year", type=int, default=DEFAULT_START_YEAR)
     parser.add_argument("--end-year", type=int, default=DEFAULT_END_YEAR)
+    parser.add_argument("--staleness-cap-days", type=int, default=DEFAULT_STALENESS_CAP_DAYS,
+                        help="Null accounting values when the latest filing is older than this many days.")
     return parser.parse_args()
 
 
@@ -501,6 +549,7 @@ def main() -> None:
         start_year=args.start_year,
         end_year=args.end_year,
         force=args.force,
+        staleness_cap_days=args.staleness_cap_days,
     )
     log(f"Compustat preprocessing finished with status: {manifest['status']}")
     log(f"Output: {manifest['output_path']}")

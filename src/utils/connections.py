@@ -16,6 +16,21 @@ def get_wrds_connection():
     )
 
 
+def get_wrds_raw_connection():
+    """Raw psycopg2 connection (bypasses wrds.Connection/SQLAlchemy) so callers can use a
+    named server-side cursor for tables too large to buffer client-side."""
+    import psycopg2
+
+    return psycopg2.connect(
+        host="wrds-pgdata.wharton.upenn.edu",
+        port=9737,
+        dbname="wrds",
+        user=os.environ["WRDS_USERNAME"],
+        sslmode="require",
+        passfile=os.path.expanduser("~/.pgpass"),
+    )
+
+
 def get_fred_client():
     import ssl
     import fredapi

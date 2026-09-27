@@ -38,6 +38,9 @@ fastmcp>=2.0.0
 faiss-cpu>=1.8.0
 sentence-transformers>=3.0.0
 
+# Testing
+pytest>=8.0.0
+
 # Utilities
 python-dotenv>=1.0.0
 tqdm>=4.66.0
